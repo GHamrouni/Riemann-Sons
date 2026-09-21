@@ -72,18 +72,26 @@ def diffuse(
     dt: float | None = None,
     record_every: int | None = None,
     callback: Callable[[float, Field], None] | None = None,
+    detach_metric: bool = False,
 ):
-    """Integrate ``∂_t f = Δ_g f`` up to time ``t``.
+    """Integrate ``∂_t f = Δ_g f`` up to time ``t`` (explicit Euler).
 
     Returns the final field, or ``(times, fields)`` when ``record_every`` is set.
     Zero-flux boundaries (or periodic wrap) are inherited from the domain, so
     the Riemannian mass ``∫ f √|g| dx`` is conserved.
+
+    The operator coefficients are built once from the metric and reused across
+    all time steps.  They keep their autograd history, so a loss on the result
+    differentiates with respect to the metric parameters (``θ → g_θ → Δ_g → f_T``);
+    pass ``detach_metric=True`` for cheaper frozen-geometry inference.
     """
+    if t <= 0:
+        return ([0.0], [field]) if record_every is not None else field
     if dt is None:
         dt = stable_diffusion_dt(field, geometry)
-    steps = max(1, int(math.ceil(t / dt)))
+    steps = max(1, int(math.ceil(t / dt - 1e-12)))
     dt = t / steps
-    op = LaplaceBeltrami(geometry, field.resolution, field.domain)
+    op = LaplaceBeltrami(geometry, field.resolution, field.domain, detach=detach_metric)
     f = field
     times, snaps = [0.0], [f]
     for k in range(1, steps + 1):
@@ -131,7 +139,13 @@ class MetricTrajectory:
 
 
 class MetricFlow:
-    """Abstract metric evolution law.  Subclasses implement :meth:`step`."""
+    """Abstract metric evolution law.  Subclasses implement :meth:`step`.
+
+    Metric flows are **forward simulation tools**: each step updates the metric's
+    parameters in place under ``no_grad`` and trajectory snapshots are detached.
+    Learning the parameters of a metric (``GradientFlow``, :func:`learning.fit_metric`)
+    is supported; differentiating *through* an entire metric evolution is not.
+    """
 
     def step(self, metric: Metric, dt: float) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -147,15 +161,21 @@ class MetricFlow:
         record_every: int = 1,
         callback: Callable[[float, Metric], None] | None = None,
     ) -> MetricTrajectory:
-        steps = max(1, int(round(t_end / dt)))
+        """Step from ``t = 0`` to exactly ``t_end`` (the last step is shortened if needed); ``t_end ≤ 0`` records the initial state only."""
         traj = MetricTrajectory(metric)
         traj.record(0.0, self.diagnostics(metric))
+        if t_end <= 0:
+            return traj
+        steps = max(1, int(math.ceil(t_end / dt - 1e-12)))
+        t = 0.0
         for k in range(1, steps + 1):
-            self.step(metric, dt)
+            step_dt = min(dt, t_end - t)
+            self.step(metric, step_dt)
+            t += step_dt
             if callback is not None:
-                callback(k * dt, metric)
+                callback(t, metric)
             if k % record_every == 0 or k == steps:
-                traj.record(k * dt, self.diagnostics(metric))
+                traj.record(t, self.diagnostics(metric))
         return traj
 
 

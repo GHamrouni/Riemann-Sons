@@ -15,9 +15,9 @@ OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 os.makedirs(OUT, exist_ok=True)
 
 
-def save(fig, name: str, dpi: int = 110) -> str:
+def save(fig, name: str, dpi: int = 110, rect=None) -> str:
     path = os.path.join(OUT, name)
-    fig.tight_layout()
+    fig.tight_layout(rect=rect)
     fig.savefig(path, dpi=dpi)
     plt.close(fig)
     print(f"  saved {os.path.relpath(path)}")

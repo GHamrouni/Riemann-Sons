@@ -165,8 +165,10 @@ def geodesic(
     variational problem is non-convex) or a tensor ``(K, n)`` of initial points.
 
     The returned points are detached.  ``Path.length(geometry)`` re-evaluates
-    the metric along the path, so gradients with respect to metric parameters
-    are available (exact to first order by the envelope theorem).
+    the metric along the *frozen* path, which gives the frozen-path
+    approximation of ``∂d_g/∂θ``: exact when the energy is at a stationary
+    point (``info["grad_norm"]`` reports ``‖∂E/∂(interior points)‖`` at the
+    returned path) and the polyline is constant-speed, approximate otherwise.
     """
     x0 = torch.as_tensor(x0)
     x1 = torch.as_tensor(x1)
@@ -216,8 +218,12 @@ def geodesic(
         else:
             raise ValueError("method must be 'lbfgs' or 'adam'")
     final = assemble(geometry.domain.clamp(interior.detach()) if clamp_to_domain else interior.detach())
+    with torch.enable_grad():
+        probe = final[1:-1].clone().requires_grad_(True)
+        (grad,) = torch.autograd.grad(path_energy(geometry, torch.cat([x0[None], probe, x1[None]])), probe)
     info["energy_history"] = history
     info["iterations"] = len(history)
+    info["grad_norm"] = float(grad.norm())  # stationarity diagnostic of the inner problem
     return Path(final, info)
 
 

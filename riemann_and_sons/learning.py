@@ -7,8 +7,15 @@ geodesic distances.  Two distance approximations are provided:
 * :func:`straight_line_distance` -- length of the *straight* segment under
   ``g`` (an upper bound of the geodesic distance, cheap, fully batched).
 * :func:`geodesic_distance` -- batched variational geodesics (a few L-BFGS
-  iterations) followed by a length evaluation whose gradient w.r.t. ``θ`` is
-  exact to first order (envelope theorem).
+  iterations) followed by a length evaluation on the *frozen* path.  Its
+  gradient w.r.t. ``θ`` is the **frozen-path approximation** of the true
+  distance gradient: it is exact when the inner problem is solved to
+  stationarity and the polyline is constant-speed (then ``L² = E`` and the
+  envelope theorem applies to ``E``); with few inner iterations it is only
+  approximate.  Measured on a 6×6 grid metric: 1.7e-4 relative error against
+  finite differences of a re-solved geodesic at convergence, but ~65 % error
+  after 10 L-BFGS iterations.  Use ``iterations`` generously or treat the
+  few-iteration mode as a stochastic descent direction, not a gradient.
 
 Regularisers keep a learned metric from degenerating into a look-up table:
 smoothness ``‖∇g‖²``, anisotropy ``λ_max/λ_min``, Euclidean prior ``‖g − I‖²``,
@@ -48,8 +55,7 @@ def straight_line_distance(metric: Metric, x: Tensor, y: Tensor, samples: int = 
     s = (torch.arange(samples, dtype=x.dtype, device=x.device) + 0.5) / samples
     d = y - x
     pts = x.unsqueeze(-2) + s.reshape(*([1] * (x.ndim - 1)), samples, 1) * d.unsqueeze(-2)  # (..., S, n)
-    g = metric(pts)
-    speed = torch.sqrt(torch.einsum("...i,...sij,...j->...s", d, g, d).clamp_min(1e-30))
+    speed = torch.sqrt(metric.quadratic_form(pts, d.unsqueeze(-2).expand_as(pts)).clamp_min(1e-30))
     return speed.mean(-1)
 
 
@@ -61,7 +67,12 @@ def geodesic_distance(
     iterations: int = 20,
     init: Tensor | None = None,
 ) -> Tensor:
-    """Batched variational geodesic distance ``(B, n), (B, n) -> (B,)``, differentiable w.r.t. the metric."""
+    """Batched variational geodesic distance ``(B, n), (B, n) -> (B,)``.
+
+    Differentiable w.r.t. the metric through the *frozen-path* gradient: the
+    optimised polyline is detached and only the length evaluation carries
+    autograd history (see the module docstring for when this is exact).
+    """
     B, n = x.shape
     s = torch.linspace(0, 1, n_points, dtype=x.dtype, device=x.device)[None, :, None]
     pts = x[:, None] * (1 - s) + y[:, None] * s if init is None else init

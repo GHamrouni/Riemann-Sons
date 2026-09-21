@@ -211,8 +211,15 @@ class Metric(nn.Module):
     def inner(self, x: Tensor, u: Tensor, v: Tensor) -> Tensor:
         return torch.einsum("...i,...ij,...j->...", u, self(x), v)
 
+    def quadratic_form(self, x: Tensor, v: Tensor) -> Tensor:
+        """``vᵀ g(x) v``.  Structured metrics override this to avoid materialising ``g``."""
+        return self.inner(x, v, v)
+
     def norm(self, x: Tensor, v: Tensor) -> Tensor:
-        return torch.sqrt(self.inner(x, v, v).clamp_min(0))
+        return torch.sqrt(self.quadratic_form(x, v).clamp_min(0))
+
+    def logdet(self, x: Tensor) -> Tensor:
+        return torch.logdet(self(x))
 
     def eigenvalues(self, x: Tensor) -> Tensor:
         return torch.linalg.eigvalsh(self(x))
@@ -430,6 +437,11 @@ class DiagonalLowRankMetric(Metric):
         self._check_dim(x)
         U = self.lowrank_fn(x)
         return torch.diag_embed(self.diag_fn(x)) + U @ U.transpose(-1, -2)
+
+    def quadratic_form(self, x: Tensor, v: Tensor) -> Tensor:
+        """``Σ_i D_i v_i² + ‖Uᵀ v‖²`` in ``O(n r)`` without forming the ``n × n`` matrix."""
+        U = self.lowrank_fn(x)
+        return (self.diag_fn(x) * v * v).sum(-1) + (torch.einsum("...ir,...i->...r", U, v) ** 2).sum(-1)
 
 
 # ---------------------------------------------------------------------------

@@ -44,14 +44,30 @@ for the spline but only approximates the intended smooth metric at scales above 
 Δ_g f = |g|^{-1/2} ∂_i ( |g|^{1/2} g^{ij} ∂_j f )
 ```
 
-is discretised in flux form on a staggered grid: for each axis `i`, `∂_i f` is a forward difference at
-the face `i + ½`; cross derivatives `∂_j f` (`j ≠ i`) are central differences at the nodes averaged to
-the face; the coefficients `|g|^{1/2} g^{ij}` are averaged to the face; the flux is differenced back to
-the nodes and divided by `|g|^{1/2}`. Boundary faces carry zero flux (Neumann) unless the domain is
-periodic. The scheme is exact for quadratic `f` and constant `g` in the interior and conserves the
-Riemannian mass `∫ f √|g| dx`.
+is assembled as a multilinear (Q1) finite-element operator on the grid cells with a lumped mass matrix:
 
-`diffuse` integrates `∂_t f = Δ_g f` with explicit Euler and the step
+```
+K_ij = Σ_cells Σ_q w_q ∇φ_i(ξ_q) · A_cell ∇φ_j(ξ_q),   A = |g|^{1/2} g^{-1} at the cell centre,
+M    = diag(|g|^{1/2}(node) · Π h),
+L    = −M^{-1} K.
+```
+
+Because every quadrature term is `Bᵀ A B` with `A` SPD and positive weight, `K = Kᵀ ⪰ 0`. Hence
+`M L = −K` is symmetric (**weighted self-adjoint**), `L` is negative semi-definite, `L 1 = 0`, the
+Riemannian mass `1ᵀ M f` is conserved by `∂_t f = L f`, and the Dirichlet energy `½ fᵀ K f` is
+dissipated. These are tested separately from accuracy in `tests/test_review_fixes.py`.
+
+Two quadratures are available. `"nodal"` (default) is the corner/trapezoidal rule: for `g = I` it
+reduces to the classical 5-point stencil, it has no checkerboard null mode, and on our tests it is
+2–4× more accurate than `"gauss"` (2-point Gauss per axis, exact for the element integrands). Both
+are second order: on a smoothly varying anisotropic periodic metric the max error against a 256²
+reference decreases as 4.5e-2 → 1.2e-2 → 2.8e-3 for 16², 32², 64² (nodal). The scheme is exact for
+quadratic `f` and constant `g` in the interior. Boundary faces carry zero flux (natural Neumann
+condition) unless the domain is periodic.
+
+The operator coefficients keep their autograd history unless `detach=True`, so a loss on a diffused
+field differentiates with respect to the metric parameters (checked against finite differences).
+`diffuse` builds the operator once per call and reuses it across time steps; its explicit Euler step is
 `dt = 0.4 · h_min² / (2 n λ_max(g^{-1}))`.
 
 ## Geodesics
@@ -72,9 +88,13 @@ Riemannian mass `∫ f √|g| dx`.
 
 * `straight_line_distance(g, x, y) = ∫₀¹ ‖y−x‖_{g(x + s(y−x))} ds` (midpoint rule). Cheap, batched,
   differentiable, and an **upper bound** on `d_g`.
-* `geodesic_distance` runs a batched variational solve for a few iterations and returns the length of the
-  (detached) path evaluated with a fresh autograd graph. By the envelope theorem this gradient equals the
-  gradient of the true geodesic distance to first order.
+* `geodesic_distance` runs a batched variational solve and returns the length of the (detached) path
+  evaluated with a fresh autograd graph: the **frozen-path gradient**. When the inner problem is at a
+  stationary point of the discrete energy `E` and the polyline is constant-speed, `L² = E` and the
+  envelope theorem for `E` transfers to `L`, so the frozen-path gradient is exact to first order.
+  Measured on a 6×6 grid metric against central finite differences of re-solved geodesics: 1.7e-4
+  relative error at convergence (`grad_norm ≈ 1e-5`), but about 65 % error after 10 L-BFGS iterations.
+  `Path.info["grad_norm"]` exposes the stationarity of the returned path.
 
 ## Metric flows
 
@@ -86,6 +106,17 @@ Riemannian mass `∫ f √|g| dx`.
   *any* parameterisation (checked numerically: Cholesky and conformal grids evolve identically).
 * `GradientFlow` is `dθ/dt = −∇_θ E(g_θ)` by explicit Euler in parameter space.
 * `HybridFlow` applies its components sequentially (Lie splitting), each with `weight · dt`.
+* `integrate` steps to exactly `t_end` (shortening the last step) and treats `t_end ≤ 0` as a no-op.
+* All flows are forward simulations: parameters are updated in place under `no_grad` and trajectory
+  snapshots are detached. Learning metric parameters is supported; differentiating through an entire
+  metric evolution is not.
+
+## Retrieval graph
+
+`GeodesicRetriever(method="graph")` builds the kNN graph once with **unique undirected edges**
+(reciprocal neighbours are inserted once; SciPy would otherwise sum duplicate COO entries and double
+those edge costs) and links each query to its `k_graph` Euclidean neighbours at query time. Graph
+weights and cached distance fields are a snapshot of the metric; `refresh()` rebuilds them.
 
 ## Transformations and Jacobians
 
