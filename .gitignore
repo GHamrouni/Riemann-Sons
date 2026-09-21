@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Riemann & Sons
+examples/output/
+.DS_Store
