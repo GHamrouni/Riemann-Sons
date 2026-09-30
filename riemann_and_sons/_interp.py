@@ -4,8 +4,8 @@ Everything that lives on a regular grid in Riemann & Sons -- learnable metric
 parameters, displacement fields, images -- is evaluated off-grid through this
 module.  Two schemes are provided:
 
-* ``"linear"``  -- multilinear interpolation (C^0).  Cheap; second derivatives
-  vanish inside a cell, so it is *not* suitable when curvature is needed.
+* ``"linear"``  -- multilinear interpolation (C^0). Cheap, but derivatives
+  jump at cell boundaries, so it is unsuitable when smooth curvature is needed.
 * ``"cubic"``   -- uniform cubic B-spline (C^2).  Slightly smoother than the
   data it is fitted to, but twice continuously differentiable, which is what
   Christoffel symbols and curvature require.
@@ -16,8 +16,10 @@ Implementation notes
   compatible with ``torch.func.vmap`` / ``jacfwd`` (unlike ``grid_sample``,
   whose double-backward support has historically been patchy).
 * Coordinate ``k`` of a point corresponds to array axis ``k`` of the grid.
-* Out-of-domain points are clamped to the boundary node (constant extension)
-  unless ``periodic=True``, in which case indices wrap (torus).
+* Out-of-domain indices repeat the nearest boundary coefficient unless
+  ``periodic=True``, in which case indices wrap (torus). A cubic spline
+  stays smooth across the boundary and becomes constant one grid cell beyond it;
+  it does not clamp queries to the boundary value.
 """
 
 from __future__ import annotations
@@ -157,7 +159,7 @@ def bspline_prefilter(node_values: Tensor, periodic: bool = False) -> Tensor:
         if m < 2:
             continue
         M = _axis_matrix(m, periodic, coeffs.dtype, coeffs.device)
-        moved = coeffs.movedim(axis, 0).reshape(m, -1)
-        solved = torch.linalg.solve(M, moved)
-        coeffs = solved.reshape(m, *[s for k, s in enumerate(coeffs.movedim(axis, 0).shape) if k > 0]).movedim(0, axis)
+        moved = coeffs.movedim(axis, 0)
+        solved = torch.linalg.solve(M, moved.reshape(m, -1))
+        coeffs = solved.reshape(moved.shape).movedim(0, axis)
     return coeffs

@@ -45,4 +45,5 @@ def test_inspector_show_and_animate(tmp_path):
     traj = rn.GradientFlow(lambda m: rn.learning.euclidean_prior(m, dom.grid(8))).integrate(gm, 0.2, 0.1)
     anim = insp.animate(traj, panels=("metric", "det"), path=str(tmp_path / "flow.gif"), fps=2)
     assert (tmp_path / "flow.gif").exists()
+    assert len(plt.gcf().axes) == 3  # two panels and one colorbar, independent of frame count
     plt.close("all")

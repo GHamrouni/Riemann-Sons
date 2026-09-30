@@ -39,4 +39,3 @@ packages = ["riemann_and_sons"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-filterwarnings = ["ignore::DeprecationWarning"]

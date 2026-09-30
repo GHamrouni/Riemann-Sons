@@ -36,7 +36,7 @@ from typing import Callable, Iterable
 import torch
 from torch import Tensor
 
-from .fields import Field
+from .fields import Field, _quadrature_weights
 from .metrics import GridMetric, Metric
 from .operators import LaplaceBeltrami
 
@@ -55,14 +55,17 @@ __all__ = [
 # Diffusion of fields
 # ---------------------------------------------------------------------------
 def stable_diffusion_dt(field: Field, geometry, safety: float = 0.4) -> float:
-    """Explicit-Euler stability bound for ``∂_t f = Δ_g f`` on the field's grid."""
-    pts = field.points
-    with torch.no_grad():
-        ginv = geometry.g_inv(pts)
-        lam_max = torch.linalg.eigvalsh(ginv)[..., -1].max()
-    h_min = field.spacing.min()
-    n = field.dim
-    return float(safety * h_min**2 / (2 * n * lam_max))
+    """Conservative explicit-Euler step for the assembled diffusion operator."""
+    return LaplaceBeltrami(geometry, field.resolution, field.domain, detach=True).stable_dt(safety)
+
+
+def _validate_integration(t: float, dt: float | None, record_every: int | None) -> None:
+    if not math.isfinite(t):
+        raise ValueError("integration time must be finite")
+    if dt is not None and (not math.isfinite(dt) or dt <= 0):
+        raise ValueError("dt must be positive and finite")
+    if record_every is not None and (not isinstance(record_every, int) or record_every <= 0):
+        raise ValueError("record_every must be a positive integer")
 
 
 def diffuse(
@@ -84,14 +87,17 @@ def diffuse(
     all time steps.  They keep their autograd history, so a loss on the result
     differentiates with respect to the metric parameters (``θ → g_θ → Δ_g → f_T``);
     pass ``detach_metric=True`` for cheaper frozen-geometry inference.
+    The default step is bounded using the assembled operator. An explicit
+    ``dt`` overrides that bound, so the caller is responsible for stability.
     """
+    _validate_integration(t, dt, record_every)
     if t <= 0:
         return ([0.0], [field]) if record_every is not None else field
-    if dt is None:
-        dt = stable_diffusion_dt(field, geometry)
-    steps = max(1, int(math.ceil(t / dt - 1e-12)))
-    dt = t / steps
     op = LaplaceBeltrami(geometry, field.resolution, field.domain, detach=detach_metric)
+    if dt is None:
+        dt = op.stable_dt()
+    steps = max(1, math.ceil(t / dt))
+    dt = t / steps
     f = field
     times, snaps = [0.0], [f]
     for k in range(1, steps + 1):
@@ -162,20 +168,24 @@ class MetricFlow:
         callback: Callable[[float, Metric], None] | None = None,
     ) -> MetricTrajectory:
         """Step from ``t = 0`` to exactly ``t_end`` (the last step is shortened if needed); ``t_end ≤ 0`` records the initial state only."""
+        _validate_integration(t_end, dt, record_every)
         traj = MetricTrajectory(metric)
         traj.record(0.0, self.diagnostics(metric))
         if t_end <= 0:
             return traj
-        steps = max(1, int(math.ceil(t_end / dt - 1e-12)))
+        steps = max(1, math.ceil(t_end / dt))
         t = 0.0
         for k in range(1, steps + 1):
-            step_dt = min(dt, t_end - t)
+            next_t = min(k * dt, t_end)
+            step_dt = next_t - t
             self.step(metric, step_dt)
-            t += step_dt
+            t = next_t
             if callback is not None:
                 callback(t, metric)
-            if k % record_every == 0 or k == steps:
+            if k % record_every == 0 or t == t_end:
                 traj.record(t, self.diagnostics(metric))
+            if t == t_end:
+                break
         return traj
 
 
@@ -186,7 +196,7 @@ class RicciFlow(MetricFlow):
         self.normalized = normalized
         self.min_eigenvalue = min_eigenvalue
         self.chunk = chunk
-        self.adaptive = adaptive  # split `dt` into sub-steps no larger than `stable_dt(metric)`
+        self.adaptive = adaptive  # use up to max_substeps based on the heuristic stable_dt
         self.max_substeps = max_substeps
 
     def stable_dt(self, metric: GridMetric, safety: float = 0.4) -> float:
@@ -219,7 +229,8 @@ class RicciFlow(MetricFlow):
         g, ric, R, vol = self._node_quantities(metric)
         g_new = g - 2 * dt * ric
         if self.normalized:
-            r = (R * vol).sum() / vol.sum()
+            weights = vol * _quadrature_weights(metric.domain, metric.resolution)
+            r = (R * weights).sum() / weights.sum()
             g_new = g_new + dt * (2 * r / metric.dim) * g
         evals, evecs = torch.linalg.eigh(0.5 * (g_new + g_new.transpose(-1, -2)))
         evals = evals.clamp_min(self.min_eigenvalue)
@@ -228,13 +239,12 @@ class RicciFlow(MetricFlow):
 
     def diagnostics(self, metric: Metric) -> dict[str, float]:
         g, ric, R, vol = self._node_quantities(metric)
-        h = metric.domain.spacing(metric.resolution)
-        cell = torch.prod(h)
+        weights = vol * _quadrature_weights(metric.domain, metric.resolution)
         return {
-            "volume": float(vol.sum() * cell),
-            "total_curvature": float((R * vol).sum() * cell),
+            "volume": float(weights.sum()),
+            "total_curvature": float((R * weights).sum()),
             "max_abs_R": float(R.abs().max()),
-            "mean_R": float((R * vol).sum() / vol.sum()),
+            "mean_R": float((R * weights).sum() / weights.sum()),
         }
 
 

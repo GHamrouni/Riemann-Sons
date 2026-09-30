@@ -8,7 +8,11 @@ import riemann_and_sons as rn
 
 @pytest.fixture(autouse=True)
 def _seed():
+    dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
     torch.manual_seed(0)
+    yield
+    torch.set_default_dtype(dtype)
 
 
 @pytest.fixture

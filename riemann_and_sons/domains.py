@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import operator
+
 import torch
 from torch import Tensor
 
@@ -19,16 +21,20 @@ class Box:
     """
 
     def __init__(self, lo, hi, periodic: bool = False):
-        lo = torch.as_tensor(lo, dtype=torch.get_default_dtype())
-        hi = torch.as_tensor(hi, dtype=torch.get_default_dtype())
+        lo = torch.as_tensor(lo)
+        hi = torch.as_tensor(hi, device=lo.device)
+        dtype = torch.promote_types(lo.dtype, hi.dtype)
+        if not dtype.is_floating_point:
+            dtype = torch.get_default_dtype()
+        lo, hi = lo.to(dtype=dtype), hi.to(dtype=dtype)
         if lo.ndim == 0:
             lo = lo.reshape(1)
         if hi.ndim == 0:
             hi = hi.reshape(1)
-        if lo.shape != hi.shape:
-            raise ValueError("lo and hi must have the same shape")
-        if not torch.all(hi > lo):
-            raise ValueError("hi must exceed lo along every axis")
+        if lo.ndim != 1 or lo.numel() == 0 or lo.shape != hi.shape:
+            raise ValueError("lo and hi must be nonempty vectors with the same shape")
+        if not torch.all(torch.isfinite(lo) & torch.isfinite(hi) & (hi > lo)):
+            raise ValueError("bounds must be finite and hi must exceed lo along every axis")
         self.lo = lo
         self.hi = hi
         self.periodic = periodic
@@ -62,11 +68,17 @@ class Box:
 
     # -------------------------------------------------------------------- grid
     def _shape(self, resolution) -> tuple[int, ...]:
-        if isinstance(resolution, int):
-            return (resolution,) * self.dim
-        shape = tuple(int(r) for r in resolution)
+        try:
+            shape = (operator.index(resolution),) * self.dim
+        except TypeError:
+            try:
+                shape = tuple(operator.index(r) for r in resolution)
+            except TypeError as exc:
+                raise ValueError("resolution must contain positive integers") from exc
         if len(shape) != self.dim:
             raise ValueError(f"resolution has {len(shape)} entries, expected {self.dim}")
+        if any(r < 1 for r in shape):
+            raise ValueError("resolution must contain positive integers")
         return shape
 
     def grid(self, resolution) -> Tensor:

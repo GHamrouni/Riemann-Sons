@@ -25,12 +25,14 @@ import math
 import torch
 from torch import Tensor
 
-from .fields import Field
+from .fields import Field, _quadrature_weights
 
 __all__ = ["gradient", "riemannian_gradient", "divergence", "laplace_beltrami", "LaplaceBeltrami", "structure_tensor"]
 
 
 def _central(f: Tensor, axis: int, h: float, periodic: bool) -> Tensor:
+    if f.shape[axis] == 1:
+        return torch.zeros_like(f)
     if periodic:
         return (torch.roll(f, -1, axis) - torch.roll(f, 1, axis)) / (2 * h)
     return torch.gradient(f, spacing=float(h), dim=axis, edge_order=1)[0]
@@ -54,10 +56,10 @@ def riemannian_gradient(field: Field, geometry) -> Tensor:
 
 def divergence(vector_values: Tensor, geometry, domain=None) -> Field:
     """Riemannian divergence of a contravariant vector field given on the grid, ``(*res, n) -> Field``."""
-    from .domains import Box
-
     dom = domain if domain is not None else geometry.domain
     n = dom.dim
+    if vector_values.ndim < n + 1 or vector_values.shape[-1] != n:
+        raise ValueError("vector_values must have shape (*channels, *resolution, domain.dim)")
     res = tuple(vector_values.shape[-n - 1 : -1])
     pts = dom.grid(res)
     sqrtg = geometry.volume_element(pts)
@@ -76,7 +78,8 @@ class LaplaceBeltrami:
     Discretisation.  Multilinear (Q1) elements on the grid cells, the metric
     evaluated at cell centres, and a ``2^n``-point tensor quadrature give the
     stiffness matrix ``K = Σ_cells Σ_q w_q ∇φ_i(ξ_q) · (|g|^{1/2} g^{-1}) ∇φ_j(ξ_q)``;
-    the mass matrix is lumped, ``M = diag(|g|^{1/2} Π h)`` at the nodes.
+    the mass matrix is lumped, using nodal ``|g|^{1/2}`` and trapezoidal
+    integration weights (uniform weights on periodic grids).
     ``quadrature="nodal"`` (default, corner/trapezoidal rule) reduces to the
     classical 5-point stencil when ``g = I`` and is the more accurate choice on
     our tests; ``"gauss"`` integrates the element integrands exactly.  Both are
@@ -100,6 +103,8 @@ class LaplaceBeltrami:
         self.domain = domain if domain is not None else geometry.domain
         self.quadrature = quadrature
         self.resolution = self.domain._shape(resolution)
+        if min(self.resolution) < 2:
+            raise ValueError("LaplaceBeltrami needs at least two nodes along every axis")
         self.periodic = self.domain.periodic
         self.h = self.domain.spacing(self.resolution)
         n = self.n = len(self.resolution)
@@ -137,7 +142,7 @@ class LaplaceBeltrami:
         w = torch.full((len(gauss),), float(torch.prod(self.h)) / len(gauss), dtype=lo.dtype, device=lo.device)
         # element stiffness K_e = Σ_q w_q B_qᵀ A B_q  -> (*cells, C, C)
         self.K = torch.einsum("q,qdc,...de,qef->...cf", w, B, A, B)
-        self.mass = self.sqrtg * torch.prod(self.h)
+        self.mass = self.sqrtg * _quadrature_weights(self.domain, self.resolution)
 
     # ------------------------------------------------------------------ apply
     def __call__(self, field: Field) -> Field:
@@ -166,6 +171,8 @@ class LaplaceBeltrami:
 
     def stiffness_apply(self, f: Tensor) -> Tensor:
         """``K f`` with shape ``(*channels, *res)``."""
+        if f.ndim < self.n or tuple(f.shape[-self.n :]) != self.resolution:
+            raise ValueError("values must end with the operator's grid resolution")
         lead = f.ndim - self.n
         F = torch.stack([self._corner(f, o, lead) for o in self.offsets], dim=-1)  # (*ch, *cells, C)
         Y = (self.K @ F.unsqueeze(-1)).squeeze(-1)  # K broadcasts over the channel axes
@@ -182,6 +189,20 @@ class LaplaceBeltrami:
         """Dirichlet energy ``½ fᵀ K f = ½ ∫ |∇f|²_g √|g| dx`` (per channel)."""
         return 0.5 * (f * self.stiffness_apply(f)).sum(dim=tuple(range(-self.n, 0)))
 
+    def stable_dt(self, safety: float = 0.4) -> float:
+        """Conservative Euler step from an absolute row-sum bound on ``M⁻¹K``."""
+        if not math.isfinite(safety) or not 0 < safety <= 1:
+            raise ValueError("safety must be finite and in (0, 1]")
+        with torch.no_grad():
+            row_sums = self.K.abs().sum(-1)
+            bound = torch.zeros_like(self.mass)
+            for ci, offset in enumerate(self.offsets):
+                bound = bound + self._scatter(row_sums[..., ci], offset, 0)
+            rate = (bound / self.mass).max().item()
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("the assembled operator must have finite positive coefficients")
+        return 2 * safety / rate
+
     def matrix(self) -> Tensor:
         """Dense ``L`` as an ``(N, N)`` matrix -- for small grids and tests."""
         N = math.prod(self.resolution)
@@ -191,7 +212,7 @@ class LaplaceBeltrami:
 
 
 def laplace_beltrami(field: Field, geometry) -> Field:
-    r"""``Δ_g f = |g|^{-1/2} ∂_i(|g|^{1/2} g^{ij} ∂_j f)`` on the grid (conservative staggered scheme)."""
+    r"""``Δ_g f`` on the grid using :class:`LaplaceBeltrami`'s conservative finite elements."""
     return LaplaceBeltrami(geometry, field.resolution, field.domain)(field)
 
 

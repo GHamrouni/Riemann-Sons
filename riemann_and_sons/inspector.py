@@ -96,7 +96,7 @@ class Inspector:
                 plot.heatmap((G**2).sum(dim=(-1, -2, -3)).sqrt(), dom, ax=ax, cmap="magma", title="‖Γ‖")
             panels.append(("christoffel", draw_gamma))
         if curvature:
-            panels.append(("curvature", lambda ax: plot.curvature(geo, ax=ax, resolution=self.resolution // 2 * 2 // 2 if self.resolution > 64 else self.resolution)))
+            panels.append(("curvature", lambda ax: plot.curvature(geo, ax=ax, resolution=self.resolution // 2 if self.resolution > 64 else self.resolution)))
         if distance is not None:
             df = distance_field(geo, torch.as_tensor(distance), self.resolution)
             def draw_dist(ax):
@@ -140,12 +140,13 @@ class Inspector:
 
         panel_kw = panel_kw or {}
         n = len(panels)
-        fig, axes = plt.subplots(1, n, figsize=(panel_size * n, panel_size), squeeze=False)
+        fig = plt.figure(figsize=(panel_size * n, panel_size))
         base_geo = self.geometry
 
         def frame(i):
-            for ax in axes.flat:
-                ax.clear()
+            # Recreate the axes so colorbars from previous frames are removed too.
+            fig.clear()
+            axes = fig.subplots(1, n, squeeze=False)
             geo = Geometry(base_geo.domain, trajectory.at(i))
             insp = Inspector(geo, self.field, self.resolution, self.ellipses)
             flags = {name: True for name in panels}

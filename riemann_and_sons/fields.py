@@ -24,11 +24,23 @@ from .domains import Box
 __all__ = ["Field", "ScalarField", "Image", "gaussian_blur"]
 
 
+def _quadrature_weights(domain: Box, resolution) -> Tensor:
+    """Tensor-product trapezoidal weights; periodic grids use uniform weights."""
+    weights = torch.ones(resolution, dtype=domain.lo.dtype, device=domain.lo.device)
+    if not domain.periodic:
+        for axis, size in enumerate(resolution):
+            if size > 1:
+                weights.select(axis, 0).mul_(0.5)
+                weights.select(axis, size - 1).mul_(0.5)
+    return weights * domain.spacing(resolution).prod()
+
+
 class Field:
     def __init__(self, values: Tensor, domain: Box):
         values = torch.as_tensor(values)
         if values.ndim < domain.dim:
             raise ValueError("values must have at least `domain.dim` spatial axes")
+        domain._shape(values.shape[-domain.dim :])
         self.values = values
         self.domain = domain
 
@@ -75,7 +87,9 @@ class Field:
         return self.like(self.values.detach())
 
     def to(self, *args, **kw) -> "Field":
-        return type(self)(self.values.to(*args, **kw), self.domain.to(*args, **kw) if "device" in kw or args else self.domain)
+        values = self.values.to(*args, **kw)
+        coordinate_dtype = values.dtype if values.is_floating_point() else self.domain.lo.dtype
+        return type(self)(values, self.domain.to(device=values.device, dtype=coordinate_dtype))
 
     # ----------------------------------------------------------- algebra
     def map(self, fn: Callable[[Tensor], Tensor]) -> "Field":
@@ -109,28 +123,26 @@ class Field:
         """Interpolate the field at points ``x`` ``(..., n)`` -> ``(..., *channels)`` (scalar: ``(...)``)."""
         feat = self.values.reshape(-1, *self.resolution).movedim(0, -1)  # (*res, C)
         out = interpolate(feat, x, self.domain.lo, self.domain.hi, mode, self.domain.periodic)
-        out = out.reshape(*x.shape[:-1], *self.channels)
+        out = out.reshape((*x.shape[:-1], *self.channels))
         return out
 
     # ----------------------------------------------------------- integrals
     def integral(self) -> Tensor:
-        """Euclidean integral ``∫ f dx`` (per channel) by the rectangle rule."""
-        cell = torch.prod(self.spacing)
-        return self.values.sum(dim=tuple(range(-self.dim, 0))) * cell
+        """Euclidean integral ``∫ f dx`` with trapezoidal weights (uniform on periodic grids)."""
+        return (self.values * _quadrature_weights(self.domain, self.resolution)).sum(dim=tuple(range(-self.dim, 0)))
 
     def riemannian_integral(self, geometry) -> Tensor:
         """``∫ f √|g| dx`` (per channel)."""
         w = geometry.volume_element(self.points)
-        cell = torch.prod(self.spacing)
-        return (self.values * w).sum(dim=tuple(range(-self.dim, 0))) * cell
+        return (self.values * w * _quadrature_weights(self.domain, self.resolution)).sum(dim=tuple(range(-self.dim, 0)))
 
     # ----------------------------------------------------------- constructors
     @classmethod
     def from_function(cls, domain: Box, resolution, fn: Callable[[Tensor], Tensor]) -> "Field":
         pts = domain.grid(resolution)
         vals = fn(pts)
-        if vals.ndim > domain.dim:  # (*res, C) -> (C, *res)
-            vals = vals.movedim(-1, 0)
+        if vals.ndim > domain.dim:  # (*res, *channels) -> (*channels, *res)
+            vals = vals.permute(*range(domain.dim, vals.ndim), *range(domain.dim))
         return cls(vals, domain)
 
     def __repr__(self) -> str:
@@ -171,7 +183,7 @@ class Image(Field):
             arr = arr.flip(0)
         vals = arr.permute(2, 1, 0).contiguous()  # (C, W, H): axis0 = x (columns), axis1 = y (rows, upwards)
         if domain is None:
-            H, W = array.shape[0], array.shape[1]
+            H, W = arr.shape[:2]
             aspect = H / W
             domain = Box([0.0, 0.0], [1.0, aspect])
         return cls(vals, domain)
@@ -216,6 +228,8 @@ def gaussian_blur(field: Field, sigma: float, truncate: float = 3.0) -> Field:
     """
     if sigma <= 0:
         return field
+    if not math.isfinite(sigma) or not math.isfinite(truncate) or truncate <= 0:
+        raise ValueError("sigma must be finite and truncate must be positive and finite")
     radius = max(1, int(math.ceil(truncate * sigma)))
     t = torch.arange(-radius, radius + 1, dtype=field.dtype, device=field.device)
     kernel = torch.exp(-0.5 * (t / sigma) ** 2)
@@ -224,15 +238,20 @@ def gaussian_blur(field: Field, sigma: float, truncate: float = 3.0) -> Field:
     n = field.dim
     lead = vals.shape[:-n]
     out = vals.reshape(-1, *field.resolution)  # (C, *res)
-    pad_mode = "circular" if field.domain.periodic else "reflect"
     for axis in range(n):
         moved = out.movedim(axis + 1, -1)  # (C, ..., N_axis)
         shape = moved.shape
         flat = moved.reshape(-1, 1, shape[-1])
-        pad = min(radius, shape[-1] - 1)
-        padded = Fnn.pad(flat, (pad, pad), mode=pad_mode)
-        if pad < radius:  # very small axis: pad remainder with replicate
-            padded = Fnn.pad(padded, (radius - pad, radius - pad), mode="replicate")
+        size = shape[-1]
+        index = torch.arange(-radius, size + radius, device=field.device)
+        if field.domain.periodic:
+            index = index.remainder(size)
+        elif size == 1:
+            index = torch.zeros_like(index)
+        else:
+            index = index.remainder(2 * (size - 1))
+            index = torch.minimum(index, 2 * (size - 1) - index)
+        padded = flat.index_select(-1, index)
         conv = Fnn.conv1d(padded, kernel.reshape(1, 1, -1))
         out = conv.reshape(shape).movedim(-1, axis + 1)
     return field.like(out.reshape(*lead, *field.resolution))

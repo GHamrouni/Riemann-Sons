@@ -40,12 +40,8 @@ def batched(fn: Callable[[Tensor], Tensor], x: Tensor, chunk: int | None = None)
     n = x.shape[-1]
     batch = x.shape[:-1]
     flat = x.reshape(-1, n)
-    if flat.shape[0] == 0:
-        return torch.empty(0)
-    if chunk is None or flat.shape[0] <= chunk:
-        out = vmap(fn)(flat)
-    else:
-        out = torch.cat([vmap(fn)(part) for part in flat.split(chunk)], dim=0)
+    # PyTorch's chunked vmap cannot infer an output from zero chunks.
+    out = vmap(fn, chunk_size=chunk if flat.shape[0] else None)(flat)
     return out.reshape(*batch, *out.shape[1:])
 
 
@@ -116,4 +112,6 @@ def scalar_curvature(metric, x: Tensor, chunk: int | None = None) -> Tensor:
 
 def gauss_curvature(metric, x: Tensor, chunk: int | None = None) -> Tensor:
     """``K = R/2`` -- the Gaussian curvature of a 2-D metric."""
+    if x.shape[-1] != 2:
+        raise ValueError("Gaussian curvature is only defined here for two-dimensional metrics")
     return 0.5 * scalar_curvature(metric, x, chunk)

@@ -4,8 +4,9 @@ Because every quantity in the library is obtained from ``g_θ`` by autograd,
 learning a geometry is just gradient descent on a loss that depends on
 geodesic distances.  Two distance approximations are provided:
 
-* :func:`straight_line_distance` -- length of the *straight* segment under
-  ``g`` (an upper bound of the geodesic distance, cheap, fully batched).
+* :func:`straight_line_distance` -- numerical length of the straight segment
+  under ``g`` (cheap and fully batched). Its exact integral bounds the geodesic
+  distance from above; finite quadrature need not preserve that bound.
 * :func:`geodesic_distance` -- batched variational geodesics (a few L-BFGS
   iterations) followed by a length evaluation on the *frozen* path.  Its
   gradient w.r.t. ``θ`` is the **frozen-path approximation** of the true
@@ -52,10 +53,12 @@ __all__ = [
 # ---------------------------------------------------------------------------
 def straight_line_distance(metric: Metric, x: Tensor, y: Tensor, samples: int = 8) -> Tensor:
     """``∫₀¹ ‖y − x‖_{g(x + s(y−x))} ds`` by the midpoint rule; shapes ``(..., n) -> (...)``."""
+    if samples < 1:
+        raise ValueError("samples must be positive")
     s = (torch.arange(samples, dtype=x.dtype, device=x.device) + 0.5) / samples
     d = y - x
     pts = x.unsqueeze(-2) + s.reshape(*([1] * (x.ndim - 1)), samples, 1) * d.unsqueeze(-2)  # (..., S, n)
-    speed = torch.sqrt(metric.quadratic_form(pts, d.unsqueeze(-2).expand_as(pts)).clamp_min(1e-30))
+    speed = metric.norm(pts, d.unsqueeze(-2).expand_as(pts))
     return speed.mean(-1)
 
 
@@ -73,7 +76,8 @@ def geodesic_distance(
     optimised polyline is detached and only the length evaluation carries
     autograd history (see the module docstring for when this is exact).
     """
-    B, n = x.shape
+    if n_points < 2 or iterations < 0:
+        raise ValueError("n_points must be at least 2 and iterations must be nonnegative")
     s = torch.linspace(0, 1, n_points, dtype=x.dtype, device=x.device)[None, :, None]
     pts = x[:, None] * (1 - s) + y[:, None] * s if init is None else init
     interior = pts[:, 1:-1].detach().clone().requires_grad_(True)
@@ -81,13 +85,11 @@ def geodesic_distance(
     def assemble(p):
         return torch.cat([x.detach()[:, None], p, y.detach()[:, None]], dim=1)
 
-    if iterations > 0:
+    if iterations > 0 and interior.numel():
         opt = torch.optim.LBFGS([interior], lr=1.0, max_iter=iterations, history_size=20, line_search_fn="strong_wolfe")
 
         def closure():
             opt.zero_grad()
-            with torch.no_grad():
-                pass
             e = path_energy(geometry, assemble(geometry.domain.clamp(interior))).sum()
             e.backward(inputs=[interior])
             return e
@@ -166,6 +168,8 @@ def fit_metric(
     (or callables) to weights.  Returns the per-epoch history of loss terms.
     """
     metric = geometry.metric
+    if optimizer not in ("adam", "sgd"):
+        raise ValueError("optimizer must be 'adam' or 'sgd'")
     params = [p for p in metric.parameters() if p.requires_grad]
     opt = torch.optim.Adam(params, lr=lr) if optimizer == "adam" else torch.optim.SGD(params, lr=lr)
     distance_kw = distance_kw or {}

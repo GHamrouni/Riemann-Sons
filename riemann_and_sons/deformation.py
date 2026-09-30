@@ -7,6 +7,7 @@ an image is warped by inverse sampling ``I'(x) = I(Φ^{-1}(x))``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable
 
@@ -56,7 +57,10 @@ class Transformation(nn.Module):
         return J.reshape(*x.shape[:-1], n, n)
 
     def inverse(self, y: Tensor, iterations: int = 30, tol: float = 1e-10, x0: Tensor | None = None) -> Tensor:
-        """Solve ``Φ(x) = y`` by damped Newton iteration (batched)."""
+        """Solve ``Φ(x) = y`` by Newton iteration (batched); return the final iterate.
+
+        Convergence requires a suitable initial guess and nonsingular Jacobians.
+        """
         x = y.clone() if x0 is None else x0.clone()
         for _ in range(iterations):
             r = self(x) - y
@@ -95,8 +99,14 @@ class Affine(Transformation):
 
     def __init__(self, A: Tensor, b: Tensor | None = None, learnable: bool = False):
         super().__init__()
-        A = torch.as_tensor(A, dtype=torch.get_default_dtype())
-        b = torch.zeros(A.shape[0], dtype=A.dtype) if b is None else torch.as_tensor(b, dtype=A.dtype)
+        A = torch.as_tensor(A)
+        if not A.is_floating_point():
+            A = A.to(torch.get_default_dtype())
+        if A.ndim != 2 or A.shape[0] != A.shape[1]:
+            raise ValueError("A must be a square matrix")
+        b = A.new_zeros(A.shape[0]) if b is None else torch.as_tensor(b, dtype=A.dtype, device=A.device)
+        if b.shape != (A.shape[0],):
+            raise ValueError("b must have one entry per coordinate")
         self.A = nn.Parameter(A, requires_grad=learnable)
         self.b = nn.Parameter(b, requires_grad=learnable)
         self.dim = A.shape[0]
@@ -105,7 +115,7 @@ class Affine(Transformation):
         return x @ self.A.transpose(-1, -2) + self.b
 
     def inverse(self, y: Tensor, **kw) -> Tensor:
-        return (y - self.b) @ torch.linalg.inv(self.A).transpose(-1, -2)
+        return torch.linalg.solve(self.A, (y - self.b).unsqueeze(-1)).squeeze(-1)
 
 
 class Composed(Transformation):
@@ -166,17 +176,23 @@ class ThinPlateSpline(Transformation):
 
     def __init__(self, sources: Tensor, targets: Tensor, reg: float = 0.0):
         super().__init__()
-        sources = torch.as_tensor(sources, dtype=torch.get_default_dtype())
-        targets = torch.as_tensor(targets, dtype=sources.dtype)
+        sources = torch.as_tensor(sources)
+        if not sources.is_floating_point():
+            sources = sources.to(torch.get_default_dtype())
+        targets = torch.as_tensor(targets, dtype=sources.dtype, device=sources.device)
+        if sources.ndim != 2 or sources.shape[-1] not in (2, 3) or targets.shape != sources.shape:
+            raise ValueError("sources and targets must have matching (N, 2) or (N, 3) shapes")
+        if not math.isfinite(reg) or reg < 0:
+            raise ValueError("reg must be nonnegative and finite")
         n, k = sources.shape[1], sources.shape[0]
         self.dim = n
         K = self._kernel(((sources[:, None, :] - sources[None, :, :]) ** 2).sum(-1))
-        P = torch.cat([torch.ones(k, 1, dtype=sources.dtype), sources], dim=1)
-        L = torch.zeros(k + n + 1, k + n + 1, dtype=sources.dtype)
-        L[:k, :k] = K + reg * torch.eye(k, dtype=sources.dtype)
+        P = torch.cat([sources.new_ones(k, 1), sources], dim=1)
+        L = sources.new_zeros(k + n + 1, k + n + 1)
+        L[:k, :k] = K + reg * torch.eye(k, dtype=sources.dtype, device=sources.device)
         L[:k, k:] = P
         L[k:, :k] = P.T
-        rhs = torch.cat([targets, torch.zeros(n + 1, n, dtype=sources.dtype)], dim=0)
+        rhs = torch.cat([targets, sources.new_zeros(n + 1, n)], dim=0)
         sol = torch.linalg.solve(L, rhs)
         self.register_buffer("sources", sources)
         self.register_buffer("W", sol[:k])
@@ -184,9 +200,10 @@ class ThinPlateSpline(Transformation):
 
     def _kernel(self, r2: Tensor) -> Tensor:
         """Radial basis as a function of the *squared* distance (forward-AD friendly)."""
+        tiny = torch.finfo(r2.dtype).tiny
         if self.dim == 2:
-            return 0.5 * r2 * torch.log(r2.clamp_min(1e-300))  # r² log r
-        return torch.sqrt(r2 + 1e-300)  # r
+            return 0.5 * r2 * torch.log(r2.clamp_min(tiny))  # r² log r
+        return torch.sqrt(r2 + tiny)  # r
 
     def forward(self, x: Tensor) -> Tensor:
         r2 = ((x[..., None, :] - self.sources) ** 2).sum(-1)  # (..., k)
@@ -229,7 +246,9 @@ def jacobian_stats(transformation: Transformation, points: Tensor, chunk: int | 
     J = transformation.jacobian(points, chunk=chunk)
     det = torch.linalg.det(J)
     sv = torch.linalg.svdvals(J)
-    return JacobianStats(J, det, sv, sv[..., 0] / sv[..., -1].clamp_min(1e-300), det <= 0, det.abs())
+    smallest = sv[..., -1]
+    condition = torch.where(smallest > 0, sv[..., 0] / smallest, torch.full_like(smallest, float("inf")))
+    return JacobianStats(J, det, sv, condition, det <= 0, det.abs())
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +267,10 @@ def warp(
 
     ``inverse`` may be supplied when ``Φ^{-1}`` is known analytically; otherwise
     it is computed numerically (Newton / fixed point).  Points that land outside
-    the image domain are filled with ``fill`` (or the clamped boundary value).
+    the image domain are filled with ``fill``; otherwise the selected
+    interpolator's boundary extension is used.
+    Periodic domains always wrap. Sampling coordinates are computed without
+    gradients; gradients with respect to the image values are preserved.
     """
     dom = image.domain
     res = image.resolution if resolution is None else dom._shape(resolution)
@@ -258,7 +280,7 @@ def warp(
     vals = image.sample(src, mode=mode)  # (*res, *channels)
     if vals.ndim > image.dim:
         vals = vals.movedim(-1, 0) if len(image.channels) == 1 else vals.permute(*range(image.dim, vals.ndim), *range(image.dim))
-    if fill is not None:
+    if fill is not None and not dom.periodic:
         inside = dom.contains(src, tol=1e-9)
         vals = torch.where(inside, vals, torch.full_like(vals, fill))
     return image.like(vals)

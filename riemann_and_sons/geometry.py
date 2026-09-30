@@ -72,10 +72,13 @@ class Geometry:
         return self.domain.grid(resolution)
 
     def total_volume(self, resolution=64) -> Tensor:
-        """Riemannian volume ``∫ √|g| dx`` by the midpoint rule on a grid."""
-        pts = self.domain.grid(resolution)
-        h = self.domain.spacing(resolution)
-        return self.volume_element(pts).sum() * torch.prod(h)
+        """Riemannian volume ``∫ √|g| dx`` using ``resolution`` midpoint cells per axis."""
+        shape = self.domain._shape(resolution)
+        lo, size = self.domain.lo, self.domain.size
+        axes = [lo[k] + (torch.arange(m, dtype=lo.dtype, device=lo.device) + 0.5) * size[k] / m
+                for k, m in enumerate(shape)]
+        pts = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)
+        return self.volume_element(pts).mean() * size.prod()
 
     # ---- paths & distances (thin wrappers) ---------------------------------
     def geodesic(self, x0: Tensor, x1: Tensor, **kw):

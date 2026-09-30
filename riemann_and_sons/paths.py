@@ -7,7 +7,7 @@ Three complementary tools:
 * :func:`geodesic` -- boundary value problem, solved variationally by
   minimising the discrete energy ``Σ Δx_k^T g(m_k) Δx_k / Δt`` over the
   interior points of a polyline (initialised from a straight line or from a
-  Dijkstra path).  Robust, differentiable, works for any metric.
+  Dijkstra path).  This finds a local minimum, not a guaranteed shortest path.
 * :func:`distance_field` -- geodesic distance from source points on a grid via
   Dijkstra on a 16-connected (2-D) / 3^n-connected graph with Riemannian edge
   lengths.  Not differentiable, but fast and global; its predecessor tree
@@ -52,7 +52,7 @@ def path_length(geometry, points: Tensor) -> Tensor:
 
 
 def path_energy(geometry, points: Tensor) -> Tensor:
-    """Discrete energy ``Σ_k ‖Δx_k‖²_g / Δt`` with ``Δt = 1/(K-1)``; minimisers are constant-speed geodesics."""
+    """Midpoint energy ``Σ_k ‖Δx_k‖²_g / Δt``, ``Δt = 1/(K-1)``, approximating continuous path energy."""
     K = points.shape[-2]
     d = points[..., 1:, :] - points[..., :-1, :]
     mid = 0.5 * (points[..., 1:, :] + points[..., :-1, :])
@@ -61,6 +61,8 @@ def path_energy(geometry, points: Tensor) -> Tensor:
 
 def resample_path(points: Tensor, n_points: int) -> Tensor:
     """Resample a polyline ``(K, n)`` to ``n_points`` equally spaced (in Euclidean arclength) points."""
+    if points.ndim != 2 or points.shape[0] == 0 or n_points < 1:
+        raise ValueError("points must have shape (K, n) with K >= 1, and n_points must be positive")
     seg = (points[1:] - points[:-1]).norm(dim=-1)
     s = torch.cat([seg.new_zeros(1), torch.cumsum(seg, 0)])
     total = s[-1]
@@ -69,7 +71,7 @@ def resample_path(points: Tensor, n_points: int) -> Tensor:
     targets = torch.linspace(0, total.item(), n_points, dtype=points.dtype, device=points.device)
     idx = torch.searchsorted(s, targets).clamp(1, len(s) - 1)
     s0, s1 = s[idx - 1], s[idx]
-    w = ((targets - s0) / (s1 - s0).clamp_min(1e-12)).unsqueeze(-1)
+    w = ((targets - s0) / torch.where(s1 > s0, s1 - s0, 1)).unsqueeze(-1)
     return points[idx - 1] * (1 - w) + points[idx] * w
 
 
@@ -120,6 +122,8 @@ def geodesic_shoot(geometry, x0: Tensor, v0: Tensor, t: float = 1.0, steps: int 
 
     Returns ``(positions, velocities)`` of shape ``(..., steps + 1, n)``.
     """
+    if steps < 1:
+        raise ValueError("steps must be positive")
     dt = t / steps
     xs = [x0]
     vs = [v0]
@@ -158,7 +162,7 @@ def geodesic(
     clamp_to_domain: bool = True,
     tol: float = 1e-10,
 ) -> Path:
-    """Shortest path between ``x0`` and ``x1`` by minimising the discrete path energy.
+    """Approximate geodesic between ``x0`` and ``x1`` by locally minimising discrete energy.
 
     ``init`` may be ``"line"`` (straight segment), ``"graph"`` (Dijkstra path on a
     grid -- recommended when the metric has strong obstacles, since the
@@ -170,8 +174,12 @@ def geodesic(
     point (``info["grad_norm"]`` reports ``‖∂E/∂(interior points)‖`` at the
     returned path) and the polyline is constant-speed, approximate otherwise.
     """
-    x0 = torch.as_tensor(x0)
-    x1 = torch.as_tensor(x1)
+    if n_points < 2 or iterations < 0:
+        raise ValueError("n_points must be at least 2 and iterations must be nonnegative")
+    if method not in ("lbfgs", "adam"):
+        raise ValueError("method must be 'lbfgs' or 'adam'")
+    x0 = torch.as_tensor(x0).detach()
+    x1 = torch.as_tensor(x1, dtype=x0.dtype, device=x0.device).detach()
     if isinstance(init, str):
         if init == "line":
             s = torch.linspace(0, 1, n_points, dtype=x0.dtype, device=x0.device)[:, None]
@@ -183,7 +191,7 @@ def geodesic(
         else:
             raise ValueError("init must be 'line', 'graph' or a tensor")
     else:
-        pts = resample_path(torch.as_tensor(init), n_points)
+        pts = resample_path(torch.as_tensor(init, dtype=x0.dtype, device=x0.device), n_points)
     interior = pts[1:-1].clone().detach().requires_grad_(True)
     info: dict = {"init": init if isinstance(init, str) else "tensor"}
 
@@ -196,27 +204,25 @@ def geodesic(
 
     history: list[float] = []
     with torch.enable_grad():
-        if method == "lbfgs":
+        if method == "lbfgs" and iterations > 0 and interior.numel():
             opt = torch.optim.LBFGS([interior], lr=1.0, max_iter=iterations, tolerance_grad=tol, tolerance_change=tol, history_size=50, line_search_fn="strong_wolfe")
 
             def closure():
                 opt.zero_grad()
                 e = energy_fn(interior)
-                e.backward()
+                e.backward(inputs=[interior])
                 history.append(e.item())
                 return e
 
             opt.step(closure)
-        elif method == "adam":
+        elif method == "adam" and interior.numel():
             opt = torch.optim.Adam([interior], lr=lr)
             for _ in range(iterations):
                 opt.zero_grad()
                 e = energy_fn(interior)
-                e.backward()
+                e.backward(inputs=[interior])
                 opt.step()
                 history.append(e.item())
-        else:
-            raise ValueError("method must be 'lbfgs' or 'adam'")
     final = assemble(geometry.domain.clamp(interior.detach()) if clamp_to_domain else interior.detach())
     with torch.enable_grad():
         probe = final[1:-1].clone().requires_grad_(True)
@@ -236,6 +242,8 @@ def parallel_transport(geometry, points: Tensor, v0: Tensor, substeps: int = 4) 
     Integrates ``v̇^k = −Γ^k_ij ẋ^i v^j`` with RK4 on each linear segment.
     Returns the transported vectors at every vertex, shape ``(K, n)``.
     """
+    if substeps < 1:
+        raise ValueError("substeps must be positive")
     out = [v0]
     v = v0
     for k in range(points.shape[0] - 1):
@@ -270,6 +278,15 @@ def _offsets(n: int, knight: bool) -> list[tuple[int, ...]]:
     return offs
 
 
+def _nearest_nodes(domain, resolution, points: Tensor) -> Tensor:
+    points = torch.as_tensor(points, dtype=domain.lo.dtype, device=domain.lo.device)
+    indices = torch.round((points - domain.lo) / domain.spacing(resolution)).long()
+    sizes = torch.as_tensor(resolution, device=indices.device)
+    indices = indices.remainder(sizes) if domain.periodic else torch.minimum(indices.clamp_min(0), sizes - 1)
+    strides = torch.as_tensor([math.prod(resolution[k + 1 :]) for k in range(domain.dim)], device=indices.device)
+    return (indices * strides).sum(-1)
+
+
 @dataclass
 class DistanceField:
     """Geodesic distance to a set of sources, sampled on a grid, plus the Dijkstra predecessor tree."""
@@ -285,22 +302,18 @@ class DistanceField:
         return self.field.values
 
     def nearest_node(self, x: Tensor) -> int:
-        dom = self.field.domain
-        res = self.field.resolution
-        h = dom.spacing(res)
-        idx = torch.round((torch.as_tensor(x) - dom.lo) / h).long()
-        sizes = torch.as_tensor(res, device=idx.device)
-        idx = torch.remainder(idx, sizes) if dom.periodic else torch.minimum(idx.clamp_min(0), sizes - 1)
-        flat = 0
-        for k in range(len(res)):
-            flat = flat * res[k] + idx[k].item()
-        return int(flat)
+        return int(_nearest_nodes(self.field.domain, self.field.resolution, x))
 
     def sample(self, x: Tensor) -> Tensor:
         return self.field.sample(x, mode="linear")
 
     def path_to(self, x: Tensor) -> Path:
-        """Discrete shortest path from ``x`` to the nearest source, following the predecessor tree."""
+        """Follow predecessors from ``x`` to the source selected by Dijkstra.
+
+        Endpoints are snapped back to the supplied coordinates. On periodic
+        domains, vertices stay in the original chart: seam crossings appear
+        as coordinate jumps, so ordinary polyline length is not meaningful.
+        """
         pts_flat = self.field.points.reshape(-1, self.field.dim)
         node = self.nearest_node(x)
         chain = [node]
@@ -312,7 +325,7 @@ class DistanceField:
         pts = pts_flat[torch.as_tensor(chain)]
         x = torch.as_tensor(x, dtype=pts.dtype, device=pts.device)
         # snap the two ends to the exact query / source coordinates
-        src_idx = torch.argmin((self.sources - pts[-1]).norm(dim=-1))
+        src_idx = torch.nonzero(self.source_nodes == chain[-1], as_tuple=True)[0][0]
         pts = torch.cat([x[None], pts[1:-1], self.sources[src_idx][None]], dim=0) if len(pts) > 1 else torch.stack([x, self.sources[src_idx]])
         return Path(pts, {"discrete": True})
 
@@ -322,8 +335,8 @@ def distance_field(geometry, sources: Tensor, resolution=128, knight_moves: bool
 
     Edge weight between neighbouring nodes ``p, q`` with displacement ``d``:
     ``½(‖d‖_{g(p)} + ‖d‖_{g(q)})`` (trapezoidal rule).  In 2-D the graph is
-    16-connected (8 neighbours + knight moves) which keeps the metrication
-    error at roughly 1-2 %.
+    16-connected (8 neighbours + knight moves). Sources are snapped to grid
+    nodes; values approximate continuous distance, with no uniform error bound.
     """
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import dijkstra
@@ -357,18 +370,25 @@ def distance_field(geometry, sources: Tensor, resolution=128, knight_moves: bool
         rows.append(src)
         cols.append(dst)
         weights.append(w.cpu().numpy())
-    graph = coo_matrix((np.concatenate(weights), (np.concatenate(rows), np.concatenate(cols))), shape=(N, N)).tocsr()
+    rows, cols, weights = np.concatenate(rows), np.concatenate(cols), np.concatenate(weights)
+    if dom.periodic:
+        # Several offsets can reach the same node on small periodic grids.
+        # Sparse COO conversion would add their lengths; retain the shortest.
+        keys = rows * N + cols
+        order = np.argsort(keys)
+        keys, starts = np.unique(keys[order], return_index=True)
+        rows, cols = keys // N, keys % N
+        weights = np.minimum.reduceat(weights[order], starts)
+    graph = coo_matrix((weights, (rows, cols)), shape=(N, N)).tocsr()
 
     sources = torch.as_tensor(sources, dtype=pts.dtype, device=pts.device)
     if sources.ndim == 1:
         sources = sources[None]
-    src_nodes = []
-    for s in sources:
-        idx = torch.round((s - dom.lo) / h).long()
-        idx = torch.minimum(idx.clamp_min(0), torch.as_tensor(res) - 1)
-        src_nodes.append(int((idx.cpu().numpy() * strides).sum()))
-    dist, pred, _ = dijkstra(graph, directed=True, indices=src_nodes, min_only=True, return_predecessors=True)
+    if sources.ndim != 2 or sources.shape[0] == 0 or sources.shape[1] != n:
+        raise ValueError(f"sources must have shape (S, {n}) with S >= 1")
+    src_nodes = _nearest_nodes(dom, res, sources)
+    dist, pred, _ = dijkstra(graph, directed=True, indices=src_nodes.cpu().numpy(), min_only=True, return_predecessors=True)
     dist_t = torch.as_tensor(dist, dtype=pts.dtype, device=pts.device).reshape(res)
     pred_t = torch.as_tensor(pred.astype(np.int64), device=pts.device)
     pred_t[pred_t < 0] = -1
-    return DistanceField(Field(dist_t, dom), sources, torch.as_tensor(src_nodes), pred_t, geometry)
+    return DistanceField(Field(dist_t, dom), sources, src_nodes, pred_t, geometry)

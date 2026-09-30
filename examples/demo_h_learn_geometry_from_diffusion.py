@@ -7,8 +7,8 @@ input patterns) fixed, can useful behaviour be recovered by changing the
 Setup
 -----
 * A reference anisotropic metric ``g*`` (smoothly rotating preferred direction).
-* Observations: several input patterns diffused under ``g*`` with an
-  independent, higher-resolution solver (2× finer grid), then sampled onto the
+* Observations: several input patterns diffused under ``g*`` with the same
+  solver on a finer grid (2× resolution), then sampled onto the
   training grid, at several times.
 * Model: an 8×8 ``GridMetric`` (Cholesky parameterisation) initialised at ``g = I``.
 * Loss: ``Σ_{k,t} ‖Diffuse(I_k, g_θ, t) − I_k,t^obs‖² + λ ‖∇g‖²``, minimised by Adam.
@@ -17,11 +17,11 @@ Setup
 
 What is identifiable
 --------------------
-In 2-D, ``Δ_{λg} = Δ_g / λ``: a conformal rescaling of the metric only rescales
-time locally.  Diffusion observations therefore constrain the *shape* of the
-metric (``g / √det g``: orientation and anisotropy) much more strongly than its
-scale, and a single pattern at a single time does not identify the metric at
-all.  We report the error of the shape and of ``det g`` separately.
+In 2-D, ``Δ_{λg} = Δ_g / λ``. A constant rescaling of the metric is equivalent
+to an inverse rescaling of time; known observation times can therefore constrain
+metric scale. A spatially varying λ changes the local diffusion rate. Recovery
+depends on which patterns and times are observed, so we report errors in both
+shape (``g / √det g``) and scale (``det g``).
 """
 
 import math
@@ -42,7 +42,7 @@ def reference_metric_fn(x):
     phi = 0.9 * torch.sin(2 * math.pi * x[..., 0]) + 0.6 * torch.cos(2 * math.pi * x[..., 1])
     t = torch.stack([torch.cos(phi), torch.sin(phi)], -1)
     eye = torch.eye(2, dtype=x.dtype)
-    return eye + 5.0 * t[..., :, None] * t[..., None, :]  # expensive across t, cheap along it
+    return eye + 5.0 * t[..., :, None] * t[..., None, :]  # expensive along t, cheap perpendicular to it
 
 
 ref = rn.Geometry(dom, rn.FunctionMetric(reference_metric_fn, dim=2))
@@ -81,9 +81,12 @@ test_names = [n for n in patterns if "held out" in n]
 
 with timer("generating observations with the 2x-resolution reference solver"):
     obs = {}
+    inputs = {}
     for name, fn in patterns.items():
         f_hi = rn.Field.from_function(dom, N_OBS, fn)
-        times, snaps = [], []
+        # Both solvers start from samples of the same signal, including noise.
+        inputs[name] = rn.Field(f_hi.sample(dom.grid(N_TRAIN)), dom)
+        snaps = []
         f = f_hi
         t_prev = 0.0
         for t in TIMES_TRAIN + [TIME_HELDOUT]:
@@ -91,7 +94,6 @@ with timer("generating observations with the 2x-resolution reference solver"):
             t_prev = t
             snaps.append(f.sample(dom.grid(N_TRAIN)).detach())  # observation on the training grid
         obs[name] = snaps
-inputs = {name: rn.Field.from_function(dom, N_TRAIN, fn) for name, fn in patterns.items()}
 
 
 def predict(geometry, field, times):
@@ -157,7 +159,7 @@ fig, axes = plt.subplots(2, 4, figsize=(19, 9.5))
 plot.metric_field(ref, ax=axes[0, 0], resolution=(16, 16), color="C0", normalize="local", title="reference metric g*  (unit balls, anisotropy 6 everywhere)")
 plot.metric_field(geo, ax=axes[0, 1], resolution=(16, 16), color_by="anisotropy", normalize="local", title="learned metric g_θ  (8×8 grid, from diffusion only)")
 its = list(range(0, ITERS, 10)) + [ITERS - 1]
-axes[0, 2].plot(its, history["train"], label="train loss"); axes[0, 2].plot(its, history["heldout"], label="held-out loss (new patterns, t = 0.006)")
+axes[0, 2].plot(its, history["train"], label="train loss"); axes[0, 2].plot(its, history["heldout"], label="held-out loss (new patterns, all four times)")
 axes[0, 2].axhline(baseline, color="k", ls="--", lw=0.8, label="held-out loss with g = I")
 axes[0, 2].set_yscale("log"); axes[0, 2].set_xlabel("iteration"); axes[0, 2].legend(fontsize=8); axes[0, 2].set_title("diffusion-matching loss")
 axes[0, 3].plot(its, history["shape"], label="metric shape error  ‖ĝ − ĝ*‖/‖ĝ*‖,  ĝ = g/√det g")

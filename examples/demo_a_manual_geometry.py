@@ -7,7 +7,7 @@ placed on the very same plane:
 
 1. Euclidean          g = I                         -> straight geodesics
 2. Conformal obstacles g = λ(x) I, λ ≫ 1 on shapes  -> geodesics bend around them
-3. Anisotropic        g = I + (κ−1) t tᵀ           -> radial travel is κ× more
+3. Anisotropic        g = I + (κ−1) t tᵀ           -> radial travel is √κ× more
    expensive than circling, so geodesics spiral.  In polar coordinates this is
    g = κ dr² + r² dθ², a *cone*: flat everywhere except at the apex, which is
    why its curvature panel is identically zero.

@@ -9,13 +9,10 @@ coordinates* and everything (points, geodesics, ellipses) overlays correctly.
 from __future__ import annotations
 
 import math
-from typing import Sequence
-
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.collections import EllipseCollection, LineCollection
-from matplotlib.patches import Ellipse
 from torch import Tensor
 
 from .fields import Field, Image

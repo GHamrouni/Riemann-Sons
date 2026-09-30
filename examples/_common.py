@@ -11,6 +11,8 @@ import torch  # noqa: E402
 
 import riemann_and_sons as rn  # noqa: E402,F401
 
+torch.set_default_dtype(torch.float64)
+
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 os.makedirs(OUT, exist_ok=True)
 

@@ -21,7 +21,7 @@ Metrics available
 
 from __future__ import annotations
 
-import math
+import operator
 from typing import Callable
 
 import torch
@@ -161,22 +161,32 @@ class DiagonalLowRankParameterization(SPDParameterization):
 
     def __init__(self, rank: int):
         super().__init__()
-        self.rank = rank
+        self.rank = operator.index(rank)
+        if self.rank < 0:
+            raise ValueError("rank must be nonnegative")
 
     def n_params(self, n: int) -> int:
+        if self.rank > n:
+            raise ValueError("rank cannot exceed the metric dimension")
         return n + n * self.rank
 
     def forward(self, raw: Tensor, n: int) -> Tensor:
+        self.n_params(n)
         d = torch.exp(raw[..., :n])
         U = raw[..., n:].reshape(*raw.shape[:-1], n, self.rank)
         return torch.diag_embed(d) + U @ U.transpose(-1, -2)
 
     def inverse(self, g: Tensor) -> Tensor:
         n = g.shape[-1]
+        self.n_params(n)
+        if self.rank == 0:
+            return torch.log(torch.diagonal(g, dim1=-2, dim2=-1))
         evals, evecs = torch.linalg.eigh(g)
         top_vals = evals[..., -self.rank :]
         top_vecs = evecs[..., :, -self.rank :]
-        rest = evals[..., : n - self.rank].mean(-1, keepdim=True).expand(*g.shape[:-2], n)
+        rest = (0.5 * evals[..., :1] if self.rank == n
+                else evals[..., : n - self.rank].mean(-1, keepdim=True))
+        rest = rest.expand(*g.shape[:-2], n)
         U = top_vecs * torch.sqrt((top_vals - rest[..., :1]).clamp_min(1e-8))[..., None, :]
         return torch.cat([torch.log(rest), U.reshape(*g.shape[:-2], -1)], dim=-1)
 
@@ -216,7 +226,11 @@ class Metric(nn.Module):
         return self.inner(x, v, v)
 
     def norm(self, x: Tensor, v: Tensor) -> Tensor:
-        return torch.sqrt(self.quadratic_form(x, v).clamp_min(0))
+        squared = self.quadratic_form(x, v)
+        # Avoid the infinite derivative of sqrt at zero, including in the
+        # unselected branch of where. The zero vector has zero gradient.
+        positive_norm = squared.clamp_min(torch.finfo(squared.dtype).tiny).sqrt()
+        return torch.where(squared <= 0, torch.zeros_like(squared), positive_norm)
 
     def logdet(self, x: Tensor) -> Tensor:
         return torch.logdet(self(x))
@@ -246,8 +260,8 @@ class Metric(nn.Module):
         return _curv.scalar_curvature(self, x, chunk=chunk)
 
     def gauss_curvature(self, x: Tensor, chunk: int | None = None) -> Tensor:
-        """``K = R / 2`` (only meaningful in two dimensions)."""
-        return 0.5 * self.scalar_curvature(x, chunk=chunk)
+        """``K = R / 2`` for a two-dimensional metric."""
+        return _curv.gauss_curvature(self, x, chunk=chunk)
 
     def metric_gradient(self, x: Tensor, chunk: int | None = None) -> Tensor:
         """``∂_k g_ij`` with shape ``(..., n, n, n)`` indexed ``[i, j, k]``."""
@@ -274,9 +288,13 @@ class ConstantMetric(Metric):
 
     def __init__(self, A: Tensor, learnable: bool = False, parameterization: SPDParameterization | None = None):
         super().__init__()
-        A = torch.as_tensor(A, dtype=torch.get_default_dtype())
+        A = torch.as_tensor(A)
+        if not A.is_floating_point():
+            A = A.to(torch.get_default_dtype())
+        if A.ndim != 2 or A.shape[0] != A.shape[1] or not torch.allclose(A, A.T):
+            raise ValueError("A must be a symmetric square matrix")
         self.dim = A.shape[-1]
-        self.param = parameterization or CholeskyParameterization()
+        self.param = parameterization or CholeskyParameterization(eps=0.0)
         raw = self.param.inverse(A)
         self.raw = nn.Parameter(raw, requires_grad=learnable)
 
@@ -328,7 +346,7 @@ class GridMetric(Metric):
     domain : Box
     resolution : int or tuple -- number of nodes per axis.
     parameterization : how raw parameters become SPD matrices (default Cholesky).
-    mode : ``"cubic"`` (C^2, default) or ``"linear"`` (C^0, no curvature).
+    mode : ``"cubic"`` (C^2, default) or ``"linear"`` (C^0, unsuitable for smooth curvature).
     """
 
     def __init__(
@@ -344,6 +362,8 @@ class GridMetric(Metric):
         self.dim = domain.dim
         self.resolution = domain._shape(resolution)
         self.param = parameterization or CholeskyParameterization()
+        if mode not in {"linear", "cubic"}:
+            raise ValueError("mode must be 'linear' or 'cubic'")
         self.mode = mode
         self.periodic = domain.periodic
         n_p = self.param.n_params(self.dim)
@@ -357,7 +377,14 @@ class GridMetric(Metric):
         self.raw = nn.Parameter(raw)
 
     # ------------------------------------------------------------------ helpers
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        self.domain = self.domain.to(device=self.raw.device, dtype=self.raw.dtype)
+        return self
+
     def _encode(self, g_nodes: Tensor) -> Tensor:
+        if g_nodes.shape != (*self.resolution, self.dim, self.dim):
+            raise ValueError("node metrics must have shape (*resolution, dimension, dimension)")
         raw = self.param.inverse(g_nodes)
         if self.mode == "cubic":
             raw = bspline_prefilter(raw, self.periodic)
